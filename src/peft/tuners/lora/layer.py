@@ -129,6 +129,9 @@ class LoraLayer(BaseTunerLayer):
         if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
             with gather_params_ctx(self.get_base_layer().weight):
                 self.pissa_init(adapter_name, init_lora_weights)
+        elif isinstance(init_lora_weights, str) and init_lora_weights == "milora":
+            with gather_params_ctx(self.get_base_layer().weight):
+                self.milora_init(adapter_name)
         elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "olora":
             with gather_params_ctx(self.get_base_layer().weight):
                 self.olora_init(adapter_name)
@@ -241,6 +244,30 @@ class LoraLayer(BaseTunerLayer):
             raise ValueError(
                 f"init_lora_weights should be 'pissa' or 'pissa_niter_[number of iters]', got {init_lora_weights} instead."
             )
+
+        lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
+        lora_B = Vr @ torch.diag(torch.sqrt(Sr))
+        self.lora_A[adapter_name].weight.data = lora_A
+        self.lora_B[adapter_name].weight.data = lora_B
+        weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
+        weight = transpose(weight.to(dtype), self.fan_in_fan_out)
+        self.get_base_layer().weight.data = weight
+
+    def milora_init(self, adapter_name):
+        weight = self.get_base_layer().weight
+        dtype = weight.dtype
+        if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            raise TypeError(
+                "Please initialize milora under float32, float16, or bfloat16. "
+                "Subsequently, re-quantize the residual model to help minimize quantization errors."
+            )
+        weight = transpose(weight.to(torch.float32), self.fan_in_fan_out)
+        # USV^T = W <-> VSU^T = W^T, where W^T = weight.data in R^{out_channel, in_channel},
+        V, S, Uh = torch.linalg.svd(weight.data, full_matrices=False)
+        Vr = V[:, -self.r[adapter_name] :]
+        Sr = S[-self.r[adapter_name] :]
+        Sr /= self.scaling[adapter_name]
+        Uhr = Uh[-self.r[adapter_name] :]
 
         lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
         lora_B = Vr @ torch.diag(torch.sqrt(Sr))

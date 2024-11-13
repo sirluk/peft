@@ -260,7 +260,7 @@ class LoraConfig(PeftConfig):
         },
     )
     init_lora_weights: (
-        bool | Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "loftq"]
+        bool | Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "loftq", "milora"]
     ) = field(
         default=True,
         metadata={
