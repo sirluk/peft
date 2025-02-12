@@ -95,6 +95,10 @@ from .tuners import (
     XLoraModel,
     get_eva_state_dict,
     initialize_lora_eva_weights,
+    SvaConfig,
+    SvaModel,
+    get_sva_state_dict,
+    initialize_sva_weights,
 )
 from .utils import (
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
@@ -199,4 +203,8 @@ __all__ = [
     "replace_lora_weights_loftq",
     "set_peft_model_state_dict",
     "shift_tokens_right",
+    "SvaConfig",
+    "SvaModel",
+    "get_sva_state_dict",
+    "initialize_sva_weights",
 ]

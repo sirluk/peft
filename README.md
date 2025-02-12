@@ -1,3 +1,7 @@
+---
+base_model: meta-llama/Llama-2-7b-hf
+library_name: peft
+---
 <!---
 Copyright 2023 The HuggingFace Team. All rights reserved.
 
@@ -156,3 +160,6 @@ To use 🤗 PEFT in your publication, please cite it by using the following BibT
   year =         {2022}
 }
 ```
+### Framework versions
+
+- PEFT 0.14.1.dev0

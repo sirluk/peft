@@ -42,7 +42,7 @@ from .prompt_tuning import PromptEmbedding, PromptTuningConfig, PromptTuningInit
 from .vblora import VBLoRAConfig, VBLoRAModel
 from .vera import VeraConfig, VeraModel
 from .xlora import XLoraConfig, XLoraModel
-
+from .sva import SvaConfig, SvaModel, get_sva_state_dict, initialize_sva_weights
 
 __all__ = [
     "AdaLoraConfig",
@@ -96,4 +96,8 @@ __all__ = [
     "XLoraModel",
     "get_eva_state_dict",
     "initialize_lora_eva_weights",
+    "SvaConfig",
+    "SvaModel",
+    "get_sva_state_dict",
+    "initialize_sva_weights",
 ]
