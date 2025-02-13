@@ -39,10 +39,11 @@ from .p_tuning import PromptEncoder, PromptEncoderConfig, PromptEncoderReparamet
 from .poly import PolyConfig, PolyModel
 from .prefix_tuning import PrefixEncoder, PrefixTuningConfig
 from .prompt_tuning import PromptEmbedding, PromptTuningConfig, PromptTuningInit
+from .sva import SvaConfig, SvaModel, get_sva_state_dict, initialize_sva_weights
 from .vblora import VBLoRAConfig, VBLoRAModel
 from .vera import VeraConfig, VeraModel
 from .xlora import XLoraConfig, XLoraModel
-from .sva import SvaConfig, SvaModel, get_sva_state_dict, initialize_sva_weights
+
 
 __all__ = [
     "AdaLoraConfig",
@@ -88,6 +89,8 @@ __all__ = [
     "PromptEncoderReparameterizationType",
     "PromptTuningConfig",
     "PromptTuningInit",
+    "SvaConfig",
+    "SvaModel",
     "VBLoRAConfig",
     "VBLoRAModel",
     "VeraConfig",
@@ -95,9 +98,7 @@ __all__ = [
     "XLoraConfig",
     "XLoraModel",
     "get_eva_state_dict",
-    "initialize_lora_eva_weights",
-    "SvaConfig",
-    "SvaModel",
     "get_sva_state_dict",
+    "initialize_lora_eva_weights",
     "initialize_sva_weights",
 ]

@@ -65,6 +65,8 @@ target_module_check_fn = partial(target_module_check_fn_default, peft_config=pef
 model = get_peft_model(model, peft_config)
 initialize_sva_weights(model, dataloader=dataloader)
 
+dummy_input = torch.randint(0, 100, (4, 128)).to("cuda")
+
 import IPython; IPython.embed(); exit(1)
 
 base_layer = model.model.layers[0].self_attn.q_proj

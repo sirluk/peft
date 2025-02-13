@@ -13,7 +13,6 @@
 # limitations under the License.
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
@@ -68,27 +67,6 @@ class SvaConfig(PeftConfig):
     """
 
     r: int = field(default=256, metadata={"help": "SVA attention dimension"})
-    sva_alpha: int = field(default=1, metadata={"help": "SVA alpha"})
-    rank_pattern: Optional[Union[list[str], str]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "The layer pattern name, used only if `layers_to_transform` is different to None and if the layer "
-                "pattern is not in the common layers pattern. This should target the `nn.ModuleList` of the "
-                "model, which is often called `'layers'` or `'h'`."
-            )
-        },
-    )
-    alpha_pattern: Optional[Union[list[str], str]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "The layer pattern name, used only if `layers_to_transform` is different to None and if the layer "
-                "pattern is not in the common layers pattern. This should target the `nn.ModuleList` of the "
-                "model, which is often called `'layers'` or `'h'`."
-            )
-        },
-    )
     target_modules: Optional[Union[list[str], str]] = field(
         default=None,
         metadata={
@@ -144,11 +122,13 @@ class SvaConfig(PeftConfig):
             )
         },
     )
+    rho: float = field(default=1.0, metadata={"help": "Rho value for SVA redistribution"})
     tau: float = field(default=0.99, metadata={"help": "Cosine similarity threshold for early stopping"})
     use_label_mask: bool = field(default=True, metadata={"help": "Use label mask for EVA initialization"})
     label_mask_value: int = field(
         default=-100, metadata={"help": "if use_label_mask=True the value to look for to mask out ignored tokens"}
     )
+    eye_init: bool = field(default=False, metadata={"help": "Initialize SVA weights with identity matrix"})
 
     def __post_init__(self):
         super().__post_init__()
@@ -159,4 +139,3 @@ class SvaConfig(PeftConfig):
         # check for layers_to_transform and layers_pattern
         if self.layers_pattern and not self.layers_to_transform:
             raise ValueError("When `layers_pattern` is specified, `layers_to_transform` must also be specified. ")
-

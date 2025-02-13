@@ -71,6 +71,7 @@ class SvaLayer(BaseTunerLayer):
         sva_dropout,
         sva_A: torch.Tensor = None,
         sva_B: torch.Tensor = None,
+        eye_init: bool = False,
     ):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
@@ -85,13 +86,18 @@ class SvaLayer(BaseTunerLayer):
 
         self.sva_dropout.update(nn.ModuleDict({adapter_name: sva_dropout_layer}))
         # Actual trainable parameters
-        self.sva_weight[adapter_name] = nn.Parameter(torch.zeros(r, r, dtype=dtype), requires_grad=True)
+        if eye_init:
+            self.sva_weight[adapter_name] = nn.Parameter(torch.eye(r, dtype=dtype), requires_grad=True)
+        else:
+            self.sva_weight[adapter_name] = nn.Parameter(torch.zeros(r, r, dtype=dtype), requires_grad=True)
 
         self.sva_A[adapter_name] = self.sva_weight[adapter_name].new_empty(self.r[adapter_name], self.in_features)
         self.sva_B[adapter_name] = self.sva_weight[adapter_name].new_empty(self.out_features, self.r[adapter_name])
 
         if bool(sva_A is None) != bool(sva_B is None):
-            raise ValueError(f"sva_A and sva_B must be both None or both not None but got sva_A={sva_A} and sva_B={sva_B}")
+            raise ValueError(
+                f"sva_A and sva_B must be both None or both not None but got sva_A={sva_A} and sva_B={sva_B}"
+            )
 
         if sva_A is not None:
             self._verify_sva_AB(adapter_name, sva_A, is_a=True)
