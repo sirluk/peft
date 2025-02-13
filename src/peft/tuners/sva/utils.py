@@ -176,7 +176,6 @@ def get_sva_state_dict(
             show_progress_bar=show_progress_bar,
         )
         sva_state_dict = sva_instance.get_sva_state_dict()
-    sva_state_dict = {k + "." + adapter_name: v for k, v in sva_state_dict.items()}
     return sva_state_dict
 
 
