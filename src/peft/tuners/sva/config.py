@@ -128,6 +128,7 @@ class SvaConfig(PeftConfig):
     label_mask_value: int = field(
         default=-100, metadata={"help": "if use_label_mask=True the value to look for to mask out ignored tokens"}
     )
+    kfac_init: bool = field(default=False, metadata={"help": "Initialize SVA weights with KFAC"})
     eye_init: bool = field(default=False, metadata={"help": "Initialize SVA weights with identity matrix"})
 
     def __post_init__(self):

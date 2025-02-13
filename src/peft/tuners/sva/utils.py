@@ -172,7 +172,7 @@ def get_sva_state_dict(
             rank_pattern=None,
             compute_forward_svd=True,
             compute_backward_svd=True,
-            sorting_strategy="kfac",
+            sorting_strategy="kfac" if sva_config.kfac_init else "simple",
             show_progress_bar=show_progress_bar,
         )
         sva_state_dict = sva_instance.get_sva_state_dict()
