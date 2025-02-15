@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
 from contextlib import nullcontext
 from functools import partial
 from typing import Dict, Iterable, Optional, Union
@@ -28,6 +27,7 @@ from peft.tuners.sva_utils import (
 )
 from peft.tuners.tuners_utils import _find_minimal_target_modules, check_target_module_exists
 from peft.utils.constants import MIN_TARGET_MODULES_FOR_OPTIMIZATION
+from peft.utils.other import _get_submodules, get_pattern_key
 
 from .config import SvaConfig
 from .layer import SvaLayer
@@ -41,37 +41,55 @@ def _load_sva_state_dict(
     sva_config = model.peft_config[adapter_name]
     update_layer_kwargs = {
         "adapter_name": adapter_name,
-        "r": sva_config.r,
         "sva_dropout": sva_config.sva_dropout,
-        "eye_init": sva_config.eye_init,
+        "init_sva_weights": sva_config.init_sva_weights,
     }
-    missing_sva_inits = []
     new_target_modules = []
     other_module_names = []
+    rank_pattern = {}
+    alpha_pattern = {}
     for name, module in model.named_modules():
         name_in_base_model = name.replace("base_model.model.", "")
         if not isinstance(module, SvaLayer):
             other_module_names.append(name_in_base_model)
             continue
+        # Regexp matching - Find key which matches current target_name in patterns provided
+        r = sva_config.rank_pattern.get(get_pattern_key(sva_config.rank_pattern.keys(), name), sva_config.r)
+        alpha = sva_config.alpha_pattern.get(
+            get_pattern_key(sva_config.alpha_pattern.keys(), name), sva_config.sva_alpha
+        )
         sva_A = sva_state_dict.pop(f"{name}.sva_A", None)
         sva_B = sva_state_dict.pop(f"{name}.sva_B", None)
-        if isinstance(sva_A, torch.Tensor) and isinstance(sva_B, torch.Tensor):
-            module.update_layer(sva_A=sva_A, sva_B=sva_B, **update_layer_kwargs)
-            new_target_modules.append(name_in_base_model)
-        else:
-            module = module.get_base_layer()
-            missing_sva_inits.append(name_in_base_model)
+        sva_metric = sva_state_dict.pop(f"{name}.sva_metric", None)
+        if sva_A is None or sva_B is None:
+            raise ValueError(f"SVA state_dict is missing module {name}")
+        new_rank = sva_A.size(0)
+        if new_rank == 0:
+            parent, _, target_name = _get_submodules(model, name)
+            setattr(parent, target_name, module.get_base_layer())
+            continue
+        if new_rank != r:
+            alpha *= new_rank / r
+        module.update_layer(
+            sva_A=sva_A, sva_B=sva_B, sva_metric=sva_metric, r=new_rank, sva_alpha=alpha, **update_layer_kwargs
+        )
+        new_target_modules.append(name_in_base_model)
+        # update rank pattern and alpha pattern
+        if new_rank != sva_config.r:
+            rank_pattern[name_in_base_model] = new_rank
+        if alpha != sva_config.sva_alpha:
+            alpha_pattern[name_in_base_model] = alpha
 
-    # update target modules if some lora layers have been removed due to their SVA rank being 0
+    # update target modules if some lora layers have been removed due to their EVA rank being 0
     if len(new_target_modules) >= MIN_TARGET_MODULES_FOR_OPTIMIZATION:
-        new_target_modules = _find_minimal_target_modules(new_target_modules, other_module_names + missing_sva_inits)
+        new_target_modules = _find_minimal_target_modules(new_target_modules, other_module_names)
     model.peft_config[adapter_name].target_modules = new_target_modules
 
-    if len(missing_sva_inits) > 0:
-        warnings.warn(
-            "the following adapter layers were converted back to torch.nn.Linear because they "
-            f"were not found in the sva state_dict: {missing_sva_inits}"
-        )
+    # set rank pattern obtained from EVA
+    model.peft_config[adapter_name].rank_pattern = rank_pattern
+
+    # when adjust_scaling_factors is True, lora scaling factors have been adjusted after the rank redistribution
+    model.peft_config[adapter_name].alpha_pattern = alpha_pattern
 
 
 def get_sva_state_dict(
@@ -172,7 +190,8 @@ def get_sva_state_dict(
             rank_pattern=None,
             compute_forward_svd=True,
             compute_backward_svd=True,
-            sorting_strategy="kfac" if sva_config.kfac_init else "simple",
+            sorting_metric=sva_config.sva_sorting_metric,
+            return_sva_metric_in_state_dict=(sva_config.init_sva_weights == "sort_metric"),
             show_progress_bar=show_progress_bar,
         )
         sva_state_dict = sva_instance.get_sva_state_dict()

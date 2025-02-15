@@ -36,8 +36,8 @@ from .layer import Linear, SvaLayer
 
 
 # TODO
-# - implement scaling
 # - implement bitsandbytes integration
+# - implement bias
 class SvaModel(BaseTuner):
     """
     Creates Vector-based Random Matrix Adaptation (SVA) model from a pretrained transformers model.
@@ -105,30 +105,18 @@ class SvaModel(BaseTuner):
             raise ValueError("Current Key shouldn't be `None`")
 
         r = sva_config.r
-        bias = hasattr(target, "bias") and target.bias is not None
-        kwargs = {
+        update_layer_kwargs = {
+            "adapter_name": adapter_name,
             "r": r,
+            "sva_alpha": sva_config.sva_alpha,
             "sva_dropout": sva_config.sva_dropout,
-            "fan_in_fan_out": sva_config.fan_in_fan_out,
-            "init_weights": sva_config.init_weights,
-            "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
-            "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
+            "init_sva_weights": False,
         }
-        kwargs["bias"] = bias
 
         if isinstance(target, Linear):
-            target.update_layer(
-                adapter_name,
-                r,
-                sva_config.sva_dropout,
-            )
+            target.update_layer(**update_layer_kwargs)
         else:
-            new_module = self._create_new_module(sva_config, adapter_name, target, **kwargs)
-            new_module.update_layer(
-                adapter_name,
-                r,
-                sva_config.sva_dropout,
-            )
+            new_module = self._create_new_module(target, update_layer_kwargs)
             if adapter_name not in self.active_adapter:
                 # adding an additional adapter: it is not automatically trainable
                 new_module.requires_grad_(False)
@@ -168,45 +156,17 @@ class SvaModel(BaseTuner):
             if "sva_weight" not in n:
                 p.requires_grad = False
 
-        for active_adapter in self.active_adapters:
-            bias = self.peft_config[active_adapter].bias
-            if bias == "none":
-                continue
-
-            if bias == "all":
-                for n, p in model.named_parameters():
-                    if "bias" in n:
-                        p.requires_grad = True
-            elif bias == "sva_only":
-                for m in model.modules():
-                    if isinstance(m, SvaLayer) and hasattr(m, "bias") and m.bias is not None:
-                        m.bias.requires_grad = True
-            else:
-                raise NotImplementedError(f"Requested bias: {bias}, is not implemented.")
-
     @staticmethod
-    def _create_new_module(sva_config, adapter_name, target, **kwargs):
-        bias = kwargs.pop("bias", False)
-
+    def _create_new_module(target, update_layer_kwargs):
         if isinstance(target, BaseTunerLayer):
             target_base_layer = target.get_base_layer()
         else:
             target_base_layer = target
 
         if isinstance(target_base_layer, torch.nn.Linear):
-            if kwargs["fan_in_fan_out"]:
-                warnings.warn(
-                    "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. "
-                    "Setting fan_in_fan_out to False."
-                )
-                kwargs["fan_in_fan_out"] = sva_config.fan_in_fan_out = False
+            fan_in_fan_out = False
         elif isinstance(target_base_layer, Conv1D):
-            kwargs["is_target_conv_1d_layer"] = True
-            if not kwargs["fan_in_fan_out"]:
-                warnings.warn(
-                    "fan_in_fan_out is set to False but the target module is `Conv1D`. Setting fan_in_fan_out to True."
-                )
-                kwargs["fan_in_fan_out"] = sva_config.fan_in_fan_out = True
+            fan_in_fan_out = True
         else:
             raise ValueError(
                 f"Target module {target} is not supported. Currently, only the following modules are supported: "
@@ -214,9 +174,8 @@ class SvaModel(BaseTuner):
             )
         new_module = Linear(
             target,
-            adapter_name,
-            bias=bias,
-            **kwargs,
+            fan_in_fan_out=fan_in_fan_out,
+            update_layer_kwargs=update_layer_kwargs,
         )
 
         return new_module

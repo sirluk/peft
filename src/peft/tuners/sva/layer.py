@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import warnings
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -35,6 +35,8 @@ class SvaLayer(BaseTunerLayer):
         self.base_layer = base_layer
         self.r = {}
         self.sva_dropout = nn.ModuleDict({})
+        self.sva_alpha = {}
+        self.scaling = {}
 
         # For storing vector scale
         self.sva_weight = nn.ParameterDict({})
@@ -68,14 +70,19 @@ class SvaLayer(BaseTunerLayer):
         self,
         adapter_name,
         r,
+        sva_alpha,
         sva_dropout,
+        init_sva_weights: Union[bool, str] = True,
         sva_A: torch.Tensor = None,
         sva_B: torch.Tensor = None,
-        eye_init: bool = False,
+        sva_metric: torch.Tensor = None,
     ):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
         self.r[adapter_name] = r
+        self.sva_alpha[adapter_name] = sva_alpha
+        self.scaling[adapter_name] = sva_alpha / r
+
         if sva_dropout > 0.0:
             sva_dropout_layer = nn.Dropout(p=sva_dropout)
         else:
@@ -85,11 +92,17 @@ class SvaLayer(BaseTunerLayer):
         dtype = weight.dtype
 
         self.sva_dropout.update(nn.ModuleDict({adapter_name: sva_dropout_layer}))
+
         # Actual trainable parameters
-        if eye_init:
-            self.sva_weight[adapter_name] = nn.Parameter(torch.eye(r, dtype=dtype), requires_grad=True)
-        else:
+        if init_sva_weights is True:
             self.sva_weight[adapter_name] = nn.Parameter(torch.zeros(r, r, dtype=dtype), requires_grad=True)
+        elif init_sva_weights == "eye":
+            self.sva_weight[adapter_name] = nn.Parameter(torch.eye(r, dtype=dtype), requires_grad=True)
+        elif init_sva_weights == "sort_metric" and sva_metric is not None:
+            p = torch.empty(r, r, dtype=dtype).copy_(torch.diag(sva_metric))
+            self.sva_weight[adapter_name] = nn.Parameter(p, requires_grad=True)
+        else:
+            self.sva_weight[adapter_name] = nn.Parameter(torch.empty(r, r, dtype=dtype), requires_grad=True)
 
         self.sva_A[adapter_name] = self.sva_weight[adapter_name].new_empty(self.r[adapter_name], self.in_features)
         self.sva_B[adapter_name] = self.sva_weight[adapter_name].new_empty(self.out_features, self.r[adapter_name])
@@ -123,26 +136,21 @@ class SvaLayer(BaseTunerLayer):
             nn.init.zeros_(self.sva_weight[adapter_name])
 
 
-class Linear(nn.Linear, SvaLayer):
+class Linear(nn.Module, SvaLayer):
     # SVA implemented in a dense layer
     def __init__(
         self,
         base_layer,
-        adapter_name: str,
-        r: int = 0,
-        sva_dropout: float = 0.0,
+        update_layer_kwargs: dict,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-        is_target_conv_1d_layer: bool = False,
         **kwargs,
     ) -> None:
         # this gets the init from nn.Linear's super perspective, i.e. nn.Module.__init__, which should always be called
-        super(nn.Linear, self).__init__()
+        super().__init__()
         SvaLayer.__init__(self, base_layer, **kwargs)
         self.fan_in_fan_out = fan_in_fan_out
-
-        self._active_adapter = adapter_name
-        self.update_layer(adapter_name, r, sva_dropout)
-        self.is_target_conv_1d_layer = is_target_conv_1d_layer
+        self._active_adapter = update_layer_kwargs["adapter_name"]
+        self.update_layer(**update_layer_kwargs)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
@@ -210,13 +218,13 @@ class Linear(nn.Linear, SvaLayer):
         # In case users wants to merge the adapter weights that are in
         # (b)float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
         # (b)float16 because some CPUs have slow bf16/fp16 matmuls.
-        cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
+        cast_to_fp32 = device.type == "cpu" and (dtype in [torch.float16, torch.bfloat16])
         if cast_to_fp32:
             sva_A = sva_A.float()
             sva_B = sva_B.float()
             sva_weight = sva_weight.float()
 
-        output_tensor = transpose(sva_B @ sva_weight @ sva_A, self.fan_in_fan_out)
+        output_tensor = transpose(sva_B @ sva_weight @ sva_A, self.fan_in_fan_out) * self.scaling[adapter]
 
         if cast_to_fp32:
             output_tensor = output_tensor.to(dtype=dtype)
@@ -244,7 +252,7 @@ class Linear(nn.Linear, SvaLayer):
                 x = F.linear(dropout(x), sva_A)
                 x = F.linear(x, sva_weight)
                 x = F.linear(x, sva_B)
-                result = result + x
+                result = result + x * self.scaling[active_adapter]
 
         return result
 

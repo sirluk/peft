@@ -274,10 +274,9 @@ def forward_fn_language_modeling(model, inputs, compute_loss=True):
     return
 
 
-class SortingStrategy(Enum):
-    SIMPLE = "simple"
-    KFAC = "kfac"
-
+class SortingMetric(Enum):
+    EXPLAINED_VARIANCE_RATIO = "evr"
+    EIGENVALUES = "eig"
 
 class SingularVectorInitializer:
     def __init__(
@@ -299,7 +298,8 @@ class SingularVectorInitializer:
         rank_pattern: Optional[dict[str, int]] = None,
         compute_forward_svd: bool = False,
         compute_backward_svd: bool = False,
-        sorting_strategy: str = "simple",
+        sorting_metric: str = "evr",
+        return_sva_metric_in_state_dict: bool = False,
         show_progress_bar: bool = True,
     ):
         self.model = model
@@ -317,7 +317,8 @@ class SingularVectorInitializer:
         self.rank_pattern = rank_pattern if rank_pattern is not None else {}
         self.compute_forward_svd = compute_forward_svd
         self.compute_backward_svd = compute_backward_svd
-        self.sorting_strategy = SortingStrategy(sorting_strategy)
+        self.sorting_metric = SortingMetric(sorting_metric)
+        self.return_sva_metric_in_state_dict = return_sva_metric_in_state_dict
         self.show_progress_bar = show_progress_bar
 
         # dataloader is not empty
@@ -337,10 +338,10 @@ class SingularVectorInitializer:
 
         # for unusually high rho values, define an upper limit
         rho_threshold = 1000
-        if rho > rho_threshold:
+        if self.rho > rho_threshold:
             max_dim = max(max(p.shape) for p in model.parameters())
-            rho_ceil = max_dim // rank
-            rho = min(rho, rho_ceil)
+            rho_ceil = max_dim // self.rank
+            self.rho = min(self.rho, rho_ceil)
 
         self.model_training = model.training
         self.model_device = get_device_with_meta_params(model)
@@ -354,147 +355,6 @@ class SingularVectorInitializer:
         self.equal_inputs_map = {}
 
         self.grad_hook_handle = None
-
-    def _get_sorting_metric(self, svd):
-        if self.sorting_strategy == SortingStrategy.SIMPLE:
-            return svd.explained_variance_ratio_
-        if self.sorting_strategy == SortingStrategy.KFAC:
-            return svd.singular_values_**2
-        raise ValueError(f"sorting_strategy {self.sorting_strategy} not supported")
-
-    def _get_rank_counts_single(self, backward_svd: bool):
-        """
-        Computes the rank distribution for each layer based on the explained variance ratio.
-        When rank_pattern flag is False, all values in max_components are the same
-        """
-        exp_vars = {
-            k: self._get_sorting_metric(h[backward_svd][0].svd)[: self.max_components[k]]
-            for k, h in self.hooks.items()
-        }
-        keys, values = zip(*[(k, c) for k, name in self.layer_hook_map.items() for c in exp_vars[name]])
-        idx = torch.stack(values).argsort(descending=True)
-        counts = Counter([keys[i] for i in idx[: self.rank_budget]])
-        return {k: counts.get(k, 0) for k in self.layer_hook_map.keys()}  # add layers with 0 rank
-
-    def _get_rank_counts_kfac(self):
-        exp_vars = {}
-        for k, layer_hooks in self.hooks.items():
-            mc = self.max_components[k]
-            (hook_forward, _), (hook_backward, _) = layer_hooks
-            exp_vars_forward = self._get_sorting_metric(hook_forward.svd)[:mc]
-            exp_vars_backward = self._get_sorting_metric(hook_backward.svd)[:mc]
-            prod = exp_vars_forward[:, None] * exp_vars_backward[None, :]
-            sorted_values, sorted_idx = prod.view(-1).sort(descending=True)
-            i, j = sorted_idx // mc, sorted_idx % mc
-            max_idx = torch.stack([i[:mc], j[:mc]])
-            exp_vars[k] = (sorted_values[:mc], max_idx + 1)
-        keys, values = zip(*[(k, v) for k, name in self.layer_hook_map.items() for v in exp_vars[name][0]])
-        idx = torch.stack(values).argsort(descending=True)
-        counts = Counter([keys[i] for i in idx[: self.rank_budget]])
-        # counts contains information about how many combinations to take from each layer
-        # we still need to get the rank required for each hook as it might be less than counts because we take combinations of singular values
-        combinations = {}
-        dummy_rank = max_idx.new_zeros(3, 1)
-        for k, name in self.layer_hook_map.items():
-            count = counts.get(name, 0)
-            combinations[k] = exp_vars.get(name, dummy_rank)[1][:, :count]
-            # forward_ranks[k] = comb[0].max().item()
-            # backward_ranks[k] = comb[1].max().item()
-        return combinations
-
-    def _get_rank_distribution(self):
-        def map_equal_inputs(ranks, equal_inputs_map):
-            for k, k_hook in equal_inputs_map.items():
-                # ensure hook layers have the highest rank if they are equal to another layer
-                rank, rank_hook = ranks[k], ranks[k_hook]
-                if isinstance(rank, torch.Tensor):
-                    check = rank_hook.max() >= rank.max()
-                else:
-                    check = rank_hook >= rank
-                if check:
-                    continue
-                ranks[k_hook], ranks[k] = rank, rank_hook
-            return ranks
-
-        if self.sorting_strategy == SortingStrategy.KFAC:
-            combinations = self._get_rank_counts_kfac()
-            combinations = map_equal_inputs(combinations, self.equal_inputs_map)
-            forward_ranks, backward_ranks = [
-                dict(x) for x in zip(*[((k, c[0]), (k, c[1])) for k, c in combinations.items()])
-            ]
-        else:
-            forward_ranks = None
-            backward_ranks = None
-            if self.compute_forward_svd:
-                forward_ranks = self._get_rank_counts_single(backward_svd=False)
-            if self.compute_backward_svd:
-                backward_ranks = self._get_rank_counts_single(backward_svd=True)
-        forward_ranks = map_equal_inputs(forward_ranks, self.equal_inputs_map)
-        backward_ranks = map_equal_inputs(backward_ranks, self.equal_inputs_map)
-        return forward_ranks, backward_ranks
-
-    @staticmethod
-    def _check_convergence(ranks, hook):
-        """
-        Checks if a layer has converged.
-        """
-        if isinstance(ranks, torch.Tensor):
-            # in case rank dist is a tensor of indices we check if all indices have converged
-            idx = ranks.unique().cpu() - 1
-            return torch.all(hook.converged[idx]).item()
-        return torch.all(hook.converged[:ranks])
-
-    def _update_convergence_dict(self, name, hook, handle, convergence_dict, backward, rank_dist):
-        """
-        Updates the convergence dictionary.
-        """
-        converged = self._check_convergence(rank_dist[name], hook)
-        # if a layer has switched from not converged to converged in the current step
-        if (not convergence_dict[name][backward]) and converged and handle:
-            handle.remove()
-            handle = None
-            if backward:
-                self._register_grad_hook()
-            convergence_dict[name][backward] = True
-        # if a layer has switched from converged to not converged in the current step
-        elif convergence_dict[name][backward] and not converged:
-            module = self.model.get_submodule(name)
-            if backward:
-                handle = module.register_full_backward_hook(hook)
-                self._remove_grad_hook()
-            else:
-                handle = module.register_forward_hook(hook)
-            convergence_dict[name][backward] = False
-        return convergence_dict, handle
-
-    def _get_model_inputs(self, inputs):
-        """
-        Get the model inputs.
-        """
-        if self.prepare_model_inputs_fn is not None:
-            model_inputs_for_hooks = self.prepare_model_inputs_fn(inputs, self.peft_config)
-        else:
-            model_inputs_for_hooks = deepcopy(inputs)
-        return model_inputs_for_hooks
-
-    def move_inputs_to_device(self, inputs, device: Union[str, torch.device, None]):
-        """
-        Move the inputs to the specified device. Adapted from hf.Trainer.
-        """
-        if device is None:
-            return inputs
-        if hasattr(inputs, "to"):
-            return inputs.to(device)
-        if isinstance(inputs, Mapping):
-            return type(inputs)({k: self.move_inputs_to_device(v, device) for k, v in inputs.items()})
-        if isinstance(inputs, (tuple, list)):
-            return type(inputs)(self.move_inputs_to_device(v, device) for v in inputs)
-        warnings.warn(f"input of type {type(inputs)} could not be moved to the correct device")
-        return inputs
-
-    @staticmethod
-    def _whiten(u, singular_values):
-        return u / singular_values.sqrt().reshape(-1, 1)
 
     @torch.no_grad()
     def _initialize_hooks(self):
@@ -557,7 +417,7 @@ class SingularVectorInitializer:
             handle_backward = None
             if self.compute_forward_svd:
                 hook_forward = SVDHook(
-                    n_components=self.rank,
+                    n_components=self.max_components[name],
                     sim_thresh=self.tau,
                     name=name,
                     prepare_layer_inputs_fn=hook._prepare_layer_inputs_fn,
@@ -567,7 +427,7 @@ class SingularVectorInitializer:
                 handle_forward = module.register_forward_hook(hook_forward)
             if self.compute_backward_svd:
                 hook_backward = SVDHook(
-                    n_components=self.rank,
+                    n_components=self.max_components[name],
                     sim_thresh=self.tau,
                     name=name,
                     prepare_layer_inputs_fn=hook._prepare_layer_inputs_fn,
@@ -577,6 +437,118 @@ class SingularVectorInitializer:
                 handle_backward = module.register_full_backward_hook(hook_backward)
             self.hooks[name] = ((hook_forward, handle_forward), (hook_backward, handle_backward))
         self.layer_hook_map = {**dict(zip(self.hooks.keys(), self.hooks.keys())), **self.equal_inputs_map}
+
+    def _get_sorting_metric(self, svd):
+        if self.sorting_metric == SortingMetric.EXPLAINED_VARIANCE_RATIO:
+            return svd.explained_variance_ratio_
+        if self.sorting_metric == SortingMetric.EIGENVALUES:
+            return svd.singular_values_ ** 2
+        raise ValueError(f"sorting_metric {self.sorting_metric} not supported")
+
+    def _get_metric_dict_single(self, backward_svd: bool):
+        """
+        Computes the rank distribution for each layer based on the explained variance ratio.
+        When rank_pattern flag is False, all values in max_components are the same
+        """
+        return {
+            k: self._get_sorting_metric(h[backward_svd][0].svd)[: self.max_components[k]]
+            for k, h in self.hooks.items()
+        }
+
+    def _get_metric_dict_multi(self):
+        metric_dict = {}
+        for k, layer_hooks in self.hooks.items():
+            mc = self.max_components[k]
+            (hook_forward, _), (hook_backward, _) = layer_hooks
+            metric_forward = self._get_sorting_metric(hook_forward.svd)[:mc]
+            metric_backward = self._get_sorting_metric(hook_backward.svd)[:mc]
+            metric_dict[k] = metric_forward * metric_backward
+        return metric_dict
+
+    def _get_rank_distribution(self):
+        def map_equal_inputs(ranks, equal_inputs_map):
+            for k, k_hook in equal_inputs_map.items():
+                # ensure hook layers have the highest rank if they are equal to another layer
+                rank, rank_hook = ranks[k], ranks[k_hook]
+                if rank_hook >= rank:
+                    continue
+                ranks[k_hook], ranks[k] = rank, rank_hook
+            return ranks
+
+        if self.compute_forward_svd and self.compute_backward_svd:
+            metric_dict = self._get_metric_dict_multi()
+        else:
+            metric_dict = self._get_metric_dict_single(self.compute_backward_svd)
+        keys, values = zip(*[(k, c) for k, name in self.layer_hook_map.items() for c in metric_dict[name]])
+        idx = torch.stack(values).argsort(descending=True)
+        counts = Counter([keys[i] for i in idx[: self.rank_budget]])
+        ranks = {k: counts.get(k, 0) for k in self.layer_hook_map.keys()}  # add layers with 0 rank
+        ranks = map_equal_inputs(ranks, self.equal_inputs_map)
+        metric_dict = {k: metric_dict[name][: ranks[k]] for k, name in self.layer_hook_map.items()}
+        return ranks, metric_dict
+
+    @staticmethod
+    def _check_convergence(rank, hook):
+        """
+        Checks if a layer has converged.
+        """
+        return torch.all(hook.converged[:rank])
+
+    def _update_convergence_dict(self, name, hook, handle, convergence_dict, rank_dist, backward, all_backward_converged):
+        """
+        Updates the convergence dictionary.
+        """
+        converged = self._check_convergence(rank_dist[name], hook)
+        # if a layer has switched from not converged to converged in the current step
+        if (not convergence_dict[name][backward]) and converged and handle:
+            handle.remove()
+            handle = None
+            convergence_dict[name][backward] = True
+        # if a layer has switched from converged to not converged in the current step
+        elif convergence_dict[name][backward] and not converged:
+            module = self.model.get_submodule(name)
+            if backward:
+                handle = module.register_full_backward_hook(hook)
+            else:
+                handle = module.register_forward_hook(hook)
+            convergence_dict[name][backward] = False
+        all_backward_converged_new = all(x[1] for x in convergence_dict.values())
+        # handle grad hook
+        if backward:
+            if all_backward_converged_new and not all_backward_converged:
+                self._remove_grad_hook()
+            elif not all_backward_converged_new and all_backward_converged:
+                self._register_grad_hook()
+        return convergence_dict, handle
+
+    def _get_model_inputs(self, inputs):
+        """
+        Get the model inputs.
+        """
+        if self.prepare_model_inputs_fn is not None:
+            model_inputs_for_hooks = self.prepare_model_inputs_fn(inputs, self.peft_config)
+        else:
+            model_inputs_for_hooks = deepcopy(inputs)
+        return model_inputs_for_hooks
+
+    def move_inputs_to_device(self, inputs, device: Union[str, torch.device, None]):
+        """
+        Move the inputs to the specified device. Adapted from hf.Trainer.
+        """
+        if device is None:
+            return inputs
+        if hasattr(inputs, "to"):
+            return inputs.to(device)
+        if isinstance(inputs, Mapping):
+            return type(inputs)({k: self.move_inputs_to_device(v, device) for k, v in inputs.items()})
+        if isinstance(inputs, (tuple, list)):
+            return type(inputs)(self.move_inputs_to_device(v, device) for v in inputs)
+        warnings.warn(f"input of type {type(inputs)} could not be moved to the correct device")
+        return inputs
+
+    @staticmethod
+    def _whiten(u, singular_values):
+        return u / singular_values.sqrt().reshape(-1, 1)
 
     def _register_grad_hook(self):
         ############## TEMP HACK ##############
@@ -609,8 +581,8 @@ class SingularVectorInitializer:
         convergence_dict = {
             k: [not self.compute_forward_svd, not self.compute_backward_svd] for k in self.hooks.keys()
         }
-        forward_ranks = self.max_components.copy()
-        backward_ranks = self.max_components.copy()
+        rank_dist = self.max_components.copy()
+        metric_dict = {}
         for inputs in pbar:
             if self.model_device is not None:
                 inputs = self.move_inputs_to_device(inputs, self.model_device)
@@ -624,8 +596,9 @@ class SingularVectorInitializer:
                         hook=hook_forward,
                         handle=handle_forward,
                         convergence_dict=convergence_dict,
+                        rank_dist=rank_dist,
                         backward=False,
-                        rank_dist=forward_ranks,
+                        all_backward_converged=all_backward_converged,
                     )
                     hook_forward.model_input = model_inputs_for_hooks
                 if self.compute_backward_svd:
@@ -634,8 +607,9 @@ class SingularVectorInitializer:
                         hook=hook_backward,
                         handle=handle_backward,
                         convergence_dict=convergence_dict,
+                        rank_dist=rank_dist,
                         backward=True,
-                        rank_dist=backward_ranks,
+                        all_backward_converged=all_backward_converged,
                     )
                     hook_backward.model_input = model_inputs_for_hooks
                 self.hooks[name] = ((hook_forward, handle_forward), (hook_backward, handle_backward))
@@ -674,8 +648,8 @@ class SingularVectorInitializer:
             ):
                 continue
 
-            # if self.rho > 1.:
-            forward_ranks, backward_ranks = self._get_rank_distribution()
+            if self.rho > 1.0 or self.return_sva_metric_in_state_dict:
+                rank_dist, metric_dict = self._get_rank_distribution()
 
         # check all custom hooks have been removed
         for method in ["_forward_hooks", "_backward_hooks"]:
@@ -690,40 +664,24 @@ class SingularVectorInitializer:
 
         sva_state_dict = {}
         converged = True
-        for name in self.target_layers:
-            rank_f = None
-            rank_b = None
+        for name, rank in rank_dist.items():
             if self.compute_forward_svd:
-                rank_f = forward_ranks[name]
                 hook_f, _ = self.hooks[self.layer_hook_map[name]][0]
-                u_A = hook_f.svd.components_
+                u_A = hook_f.svd.components_[:rank]
                 if self.whiten:
-                    u_A = self._whiten(u_A, hook_f.svd.singular_values_)
-                converged = converged and self._check_convergence(rank_f, hook_f)
+                    u_A = self._whiten(u_A, hook_f.svd.singular_values_[:rank])
+                converged = converged and self._check_convergence(rank, hook_f)
                 sva_state_dict[f"{name}.sva_A"] = u_A
             if self.compute_backward_svd:
-                rank_b = backward_ranks[name]
                 hook_b, _ = self.hooks[self.layer_hook_map[name]][1]
-                u_B = hook_b.svd.components_
+                u_B = hook_b.svd.components_[:rank]
                 if self.whiten:
-                    u_B = self._whiten(u_B, hook_b.svd.singular_values_)
-                converged = converged and self._check_convergence(rank_b, hook_b)
+                    u_B = self._whiten(u_B, hook_b.svd.singular_values_[:rank])
+                converged = converged and self._check_convergence(rank, hook_b)
                 sva_state_dict[f"{name}.sva_B"] = u_B.T
-            if self.sorting_strategy == SortingStrategy.KFAC:
-                metric_forward = self._get_sorting_metric(hook_f.svd)[rank_f]
-                metric_backward = self._get_sorting_metric(hook_b.svd)[rank_b]
-                alpha = metric_forward.sqrt() * metric_backward.sqrt()
-                u_A = u_A.gather(0, rank_f.view(-1, 1).expand(-1, u_A.size(1)))
-                u_B = u_B.gather(0, rank_b.view(-1, 1).expand(-1, u_B.size(1)))
-                sva_state_dict[f"{name}.sva_A"] = u_A * alpha.view(-1, 1)
-                sva_state_dict[f"{name}.sva_B"] = u_B.T
+            if self.return_sva_metric_in_state_dict:
+                sva_state_dict[f"{name}.sva_metric"] = metric_dict[name]
             if not converged:
-                if isinstance(rank_f, torch.Tensor):
-                    rank = rank_f.size(0)
-                elif isinstance(rank_b, torch.Tensor):
-                    rank = rank_b.size(0)
-                else:
-                    rank = rank_f or rank_b
                 raise ValueError(
                     f"Layer {name} has not converged but was assigned rank {rank}. "
                     "Please report this issue at https://github.com/huggingface/peft/issues"

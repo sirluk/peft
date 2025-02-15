@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 from peft.config import PeftConfig
 from peft.utils import PeftType
@@ -78,10 +78,7 @@ class SvaConfig(PeftConfig):
         },
     )
     sva_dropout: float = field(default=0.0, metadata={"help": "SVA dropout"})
-    fan_in_fan_out: bool = field(
-        default=False,
-        metadata={"help": "Set this to True if the layer to replace stores weight like (fan_in, fan_out)"},
-    )
+    sva_alpha: int = field(default=1, metadata={"help": "SVA alpha"})
     bias: str = field(default="none", metadata={"help": "Bias type for SVA. Can be 'none', 'all' or 'sva_only'"})
     modules_to_save: Optional[list[str]] = field(
         default=None,
@@ -122,14 +119,42 @@ class SvaConfig(PeftConfig):
             )
         },
     )
+    rank_pattern: Optional[dict] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "The mapping from layer names or regexp expression to ranks which are different from the default rank specified by `r`. "
+                "For example, `{model.decoder.layers.0.encoder_attn.k_proj: 8`}"
+            )
+        },
+    )
+    alpha_pattern: Optional[dict] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "The mapping from layer names or regexp expression to alphas which are different from the default alpha specified by `lora_alpha`. "
+                "For example, `{model.decoder.layers.0.encoder_attn.k_proj: 32`}"
+            )
+        },
+    )
     rho: float = field(default=1.0, metadata={"help": "Rho value for SVA redistribution"})
     tau: float = field(default=0.99, metadata={"help": "Cosine similarity threshold for early stopping"})
     use_label_mask: bool = field(default=True, metadata={"help": "Use label mask for EVA initialization"})
     label_mask_value: int = field(
         default=-100, metadata={"help": "if use_label_mask=True the value to look for to mask out ignored tokens"}
     )
-    kfac_init: bool = field(default=False, metadata={"help": "Initialize SVA weights with KFAC"})
-    eye_init: bool = field(default=False, metadata={"help": "Initialize SVA weights with identity matrix"})
+    sva_sorting_metric: Literal["evr", "sv"] = field(
+        default="sv",
+        metadata={
+            "help": "Which sorting metric to use when redistributing ranks. Passing `'evr'` for explained variance ratio, `'sv'` for singular values"
+        },
+    )
+    init_sva_weights: bool | Literal["eye", "sort_metric"] = field(
+        default=True,
+        metadata={
+            "help": "How to initialize the weights of the SVA layers. Passing `True` for 0 initialization. Passing`'sort_metric'` results in initialization of a zero matrix with the sorting values on the diagonal."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
