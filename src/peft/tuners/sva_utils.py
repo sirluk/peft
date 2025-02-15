@@ -276,6 +276,9 @@ def forward_fn_language_modeling(model, inputs, compute_loss=True):
 
 class SortingMetric(Enum):
     EXPLAINED_VARIANCE_RATIO = "evr"
+    EXPLAINED_VARIANCE = "ev"
+    EXPLAINED_VARIANCE_SUM = "ev_sum"
+    EXPLAINED_VARIANCE_MAX = "ev_max"
     EIGENVALUES = "eig"
 
 class SingularVectorInitializer:
@@ -441,7 +444,13 @@ class SingularVectorInitializer:
     def _get_sorting_metric(self, svd):
         if self.sorting_metric == SortingMetric.EXPLAINED_VARIANCE_RATIO:
             return svd.explained_variance_ratio_
-        if self.sorting_metric == SortingMetric.EIGENVALUES:
+        elif self.sorting_metric == SortingMetric.EXPLAINED_VARIANCE:
+            return svd.explained_variance_
+        elif self.sorting_metric == SortingMetric.EXPLAINED_VARIANCE_SUM:
+            return svd.explained_variance_ / svd.explained_variance_.sum()
+        elif self.sorting_metric == SortingMetric.EXPLAINED_VARIANCE_MAX:
+            return svd.explained_variance_ / svd.explained_variance_.max()
+        elif self.sorting_metric == SortingMetric.EIGENVALUES:
             return svd.singular_values_ ** 2
         raise ValueError(f"sorting_metric {self.sorting_metric} not supported")
 

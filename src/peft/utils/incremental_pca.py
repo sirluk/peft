@@ -72,7 +72,7 @@ class IncrementalPCA:
         if self.lowrank_q is None:
             if self.n_components is None:
                 raise ValueError("n_components must be specified when using lowrank mode with lowrank_q=None.")
-            self.lowrank_q = self.n_components * 2
+            self.lowrank_q = self.n_components + min(self.n_components // 4, 10)
         elif self.lowrank_q < self.n_components:
             raise ValueError("lowrank_q must be greater than or equal to n_components.")
 
