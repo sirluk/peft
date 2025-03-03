@@ -281,6 +281,7 @@ class SortingMetric(Enum):
     EXPLAINED_VARIANCE_MAX = "ev_max"
     EIGENVALUES = "eig"
 
+
 class SingularVectorInitializer:
     def __init__(
         self,
@@ -451,7 +452,7 @@ class SingularVectorInitializer:
         elif self.sorting_metric == SortingMetric.EXPLAINED_VARIANCE_MAX:
             return svd.explained_variance_ / svd.explained_variance_.max()
         elif self.sorting_metric == SortingMetric.EIGENVALUES:
-            return svd.singular_values_ ** 2
+            return svd.singular_values_**2
         raise ValueError(f"sorting_metric {self.sorting_metric} not supported")
 
     def _get_metric_dict_single(self, backward_svd: bool):
@@ -503,7 +504,9 @@ class SingularVectorInitializer:
         """
         return torch.all(hook.converged[:rank])
 
-    def _update_convergence_dict(self, name, hook, handle, convergence_dict, rank_dist, backward, all_backward_converged):
+    def _update_convergence_dict(
+        self, name, hook, handle, convergence_dict, rank_dist, backward, all_backward_converged
+    ):
         """
         Updates the convergence dictionary.
         """

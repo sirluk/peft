@@ -99,6 +99,8 @@ class EvaConfig:
         adjust_scaling_factors (`bool`):
             Adjust LoRA scaling factors after the rank redistribution. Setting this to True means the scaling factors
             are adjusted so that all LoRA gradients have the same scale regardless of their rank. Default is True.
+        gradient_based_decision (`bool`):
+            Use gradient-based decision for EVA. Default is False.
     """
 
     rho: float = field(default=2.0, metadata={"help": "Rho value for EVA redistribution"})
@@ -111,6 +113,10 @@ class EvaConfig:
     adjust_scaling_factors: bool = field(
         default=True,
         metadata={"help": "Adjust LoRA scaling factors after the rank redistribution"},
+    )
+    gradient_based_decision: bool = field(
+        default=False,
+        metadata={"help": "Use gradient-based decision for EVA"},
     )
 
     def __post_init__(self):

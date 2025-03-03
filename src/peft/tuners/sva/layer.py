@@ -70,8 +70,8 @@ class SvaLayer(BaseTunerLayer):
         self,
         adapter_name,
         r,
-        sva_alpha,
-        sva_dropout,
+        sva_dropout: float = 0.0,
+        sva_alpha: Optional[float] = None,
         init_sva_weights: Union[bool, str] = True,
         sva_A: torch.Tensor = None,
         sva_B: torch.Tensor = None,
@@ -80,8 +80,9 @@ class SvaLayer(BaseTunerLayer):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
         self.r[adapter_name] = r
-        self.sva_alpha[adapter_name] = sva_alpha
-        self.scaling[adapter_name] = sva_alpha / r
+
+        self.sva_alpha[adapter_name] = sva_alpha or r
+        self.scaling[adapter_name] = self.sva_alpha[adapter_name] / r
 
         if sva_dropout > 0.0:
             sva_dropout_layer = nn.Dropout(p=sva_dropout)

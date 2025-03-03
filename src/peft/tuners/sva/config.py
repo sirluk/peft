@@ -78,7 +78,6 @@ class SvaConfig(PeftConfig):
         },
     )
     sva_dropout: float = field(default=0.0, metadata={"help": "SVA dropout"})
-    sva_alpha: int = field(default=1, metadata={"help": "SVA alpha"})
     bias: str = field(default="none", metadata={"help": "Bias type for SVA. Can be 'none', 'all' or 'sva_only'"})
     modules_to_save: Optional[list[str]] = field(
         default=None,
@@ -125,15 +124,6 @@ class SvaConfig(PeftConfig):
             "help": (
                 "The mapping from layer names or regexp expression to ranks which are different from the default rank specified by `r`. "
                 "For example, `{model.decoder.layers.0.encoder_attn.k_proj: 8`}"
-            )
-        },
-    )
-    alpha_pattern: Optional[dict] = field(
-        default_factory=dict,
-        metadata={
-            "help": (
-                "The mapping from layer names or regexp expression to alphas which are different from the default alpha specified by `lora_alpha`. "
-                "For example, `{model.decoder.layers.0.encoder_attn.k_proj: 32`}"
             )
         },
     )

@@ -33,6 +33,7 @@ from .config import SvaConfig
 from .layer import SvaLayer
 
 
+@torch.no_grad()
 def _load_sva_state_dict(
     model: torch.nn.Module,
     sva_state_dict: dict,
@@ -47,7 +48,6 @@ def _load_sva_state_dict(
     new_target_modules = []
     other_module_names = []
     rank_pattern = {}
-    alpha_pattern = {}
     for name, module in model.named_modules():
         name_in_base_model = name.replace("base_model.model.", "")
         if not isinstance(module, SvaLayer):
@@ -55,9 +55,6 @@ def _load_sva_state_dict(
             continue
         # Regexp matching - Find key which matches current target_name in patterns provided
         r = sva_config.rank_pattern.get(get_pattern_key(sva_config.rank_pattern.keys(), name), sva_config.r)
-        alpha = sva_config.alpha_pattern.get(
-            get_pattern_key(sva_config.alpha_pattern.keys(), name), sva_config.sva_alpha
-        )
         sva_A = sva_state_dict.pop(f"{name}.sva_A", None)
         sva_B = sva_state_dict.pop(f"{name}.sva_B", None)
         sva_metric = sva_state_dict.pop(f"{name}.sva_metric", None)
@@ -68,17 +65,13 @@ def _load_sva_state_dict(
             parent, _, target_name = _get_submodules(model, name)
             setattr(parent, target_name, module.get_base_layer())
             continue
-        if new_rank != r:
-            alpha *= new_rank / r
         module.update_layer(
-            sva_A=sva_A, sva_B=sva_B, sva_metric=sva_metric, r=new_rank, sva_alpha=alpha, **update_layer_kwargs
+            sva_A=sva_A, sva_B=sva_B, sva_metric=sva_metric, r=new_rank, **update_layer_kwargs
         )
         new_target_modules.append(name_in_base_model)
-        # update rank pattern and alpha pattern
+        # update rank pattern
         if new_rank != sva_config.r:
             rank_pattern[name_in_base_model] = new_rank
-        if alpha != sva_config.sva_alpha:
-            alpha_pattern[name_in_base_model] = alpha
 
     # update target modules if some lora layers have been removed due to their EVA rank being 0
     if len(new_target_modules) >= MIN_TARGET_MODULES_FOR_OPTIMIZATION:
@@ -87,9 +80,6 @@ def _load_sva_state_dict(
 
     # set rank pattern obtained from EVA
     model.peft_config[adapter_name].rank_pattern = rank_pattern
-
-    # when adjust_scaling_factors is True, lora scaling factors have been adjusted after the rank redistribution
-    model.peft_config[adapter_name].alpha_pattern = alpha_pattern
 
 
 def get_sva_state_dict(

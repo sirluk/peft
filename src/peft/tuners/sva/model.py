@@ -105,11 +105,9 @@ class SvaModel(BaseTuner):
             raise ValueError("Current Key shouldn't be `None`")
 
         r = sva_config.rank_pattern.get(current_key, sva_config.r)
-        sva_alpha = sva_config.alpha_pattern.get(current_key, sva_config.sva_alpha)
         update_layer_kwargs = {
             "adapter_name": adapter_name,
             "r": r,
-            "sva_alpha": sva_alpha,
             "sva_dropout": sva_config.sva_dropout,
             "init_sva_weights": False,
         }
