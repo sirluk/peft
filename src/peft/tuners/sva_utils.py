@@ -151,7 +151,7 @@ class SVDHook(_Hook):
         states = self.gather_layer_inputs(states)
         # check if batch sizes is more than the number of components
         if states.size(0) < self.n_components:
-            print(f"skipping SVD for {self.name} because there are less than {self.n_components} examples")
+            warnings.warn(f"skipping SVD for {self.name} because there are less than {self.n_components} examples")
             return
         self.svd.partial_fit(states.to(torch.float32))
         # add if statement to check if we are in the first step where previous_components is None
