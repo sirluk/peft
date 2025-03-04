@@ -33,7 +33,8 @@ class SvaLayer(BaseTunerLayer):
 
     def __init__(self, base_layer: nn.Module, **kwargs):
         self.base_layer = base_layer
-        self.r = {}
+        self.r_a = {}
+        self.r_b = {}
         self.sva_dropout = nn.ModuleDict({})
         self.sva_alpha = {}
         self.scaling = {}
@@ -69,7 +70,8 @@ class SvaLayer(BaseTunerLayer):
     def update_layer(
         self,
         adapter_name,
-        r,
+        r_a,
+        r_b=None,
         sva_dropout: float = 0.0,
         sva_alpha: Optional[float] = None,
         init_sva_weights: Union[bool, str] = True,
@@ -77,12 +79,16 @@ class SvaLayer(BaseTunerLayer):
         sva_B: torch.Tensor = None,
         sva_metric: torch.Tensor = None,
     ):
-        if r <= 0:
-            raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
-        self.r[adapter_name] = r
+        if r_a <= 0 or r_b <= 0:
+            raise ValueError(
+                f"`r_a` and `r_b` should be a positive integer value but the value passed is {r_a} and {r_b}"
+            )
+        self.r_a[adapter_name] = r_a
+        self.r_b[adapter_name] = r_b
 
-        self.sva_alpha[adapter_name] = sva_alpha or r
-        self.scaling[adapter_name] = self.sva_alpha[adapter_name] / r
+        avg_r = (r_a + r_b) / 2
+        self.sva_alpha[adapter_name] = sva_alpha or avg_r
+        self.scaling[adapter_name] = self.sva_alpha[adapter_name] / avg_r
 
         if sva_dropout > 0.0:
             sva_dropout_layer = nn.Dropout(p=sva_dropout)
@@ -96,17 +102,17 @@ class SvaLayer(BaseTunerLayer):
 
         # Actual trainable parameters
         if init_sva_weights is True:
-            self.sva_weight[adapter_name] = nn.Parameter(torch.zeros(r, r, dtype=dtype), requires_grad=True)
+            self.sva_weight[adapter_name] = nn.Parameter(torch.zeros(r_b, r_a, dtype=dtype), requires_grad=True)
         elif init_sva_weights == "eye":
-            self.sva_weight[adapter_name] = nn.Parameter(torch.eye(r, dtype=dtype), requires_grad=True)
+            self.sva_weight[adapter_name] = nn.Parameter(torch.eye(r_b, r_a, dtype=dtype), requires_grad=True)
         elif init_sva_weights == "sort_metric" and sva_metric is not None:
-            p = torch.empty(r, r, dtype=dtype).copy_(torch.diag(sva_metric))
+            p = torch.empty(r_b, r_a, dtype=dtype).copy_(torch.diag(sva_metric))
             self.sva_weight[adapter_name] = nn.Parameter(p, requires_grad=True)
         else:
-            self.sva_weight[adapter_name] = nn.Parameter(torch.empty(r, r, dtype=dtype), requires_grad=True)
+            self.sva_weight[adapter_name] = nn.Parameter(torch.empty(r_b, r_a, dtype=dtype), requires_grad=True)
 
-        self.sva_A[adapter_name] = self.sva_weight[adapter_name].new_empty(self.r[adapter_name], self.in_features)
-        self.sva_B[adapter_name] = self.sva_weight[adapter_name].new_empty(self.out_features, self.r[adapter_name])
+        self.sva_A[adapter_name] = self.sva_weight[adapter_name].new_empty(self.r_a[adapter_name], self.in_features)
+        self.sva_B[adapter_name] = self.sva_weight[adapter_name].new_empty(self.out_features, self.r_b[adapter_name])
 
         if bool(sva_A is None) != bool(sva_B is None):
             raise ValueError(
@@ -125,9 +131,9 @@ class SvaLayer(BaseTunerLayer):
     def _verify_sva_AB(self, adapter_name, frozen, is_a: bool):
         # check input size
         if is_a:
-            expected_shape = (self.r[adapter_name], self.in_features)
+            expected_shape = (self.r_a[adapter_name], self.in_features)
         else:
-            expected_shape = (self.out_features, self.r[adapter_name])
+            expected_shape = (self.out_features, self.r_b[adapter_name])
         if frozen.shape != expected_shape:
             k = "sva_A" if is_a else "sva_B"
             raise ValueError(f"{k} has a size {frozen.shape} but {expected_shape} is expected")

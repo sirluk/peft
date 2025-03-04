@@ -123,7 +123,8 @@ class SvaConfig(PeftConfig):
         metadata={
             "help": (
                 "The mapping from layer names or regexp expression to ranks which are different from the default rank specified by `r`. "
-                "For example, `{model.decoder.layers.0.encoder_attn.k_proj: 8`}"
+                "For example, `{model.decoder.layers.0.encoder_attn.k_proj: 8`}. Can also contain `r_a` and `r_b` for different ranks for A and B."
+                "For example, `{model.decoder.layers.0.encoder_attn.k_proj: (8, 15)}`."
             )
         },
     )
@@ -143,6 +144,15 @@ class SvaConfig(PeftConfig):
         default=True,
         metadata={
             "help": "How to initialize the weights of the SVA layers. Passing `True` for 0 initialization. Passing`'sort_metric'` results in initialization of a zero matrix with the sorting values on the diagonal."
+        },
+    )
+    uniform_rank_per_layer: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to initialize the weights of the SVA layers with their default initialization. Don't change "
+                "this setting, except if you know exactly what you're doing."
+            ),
         },
     )
 

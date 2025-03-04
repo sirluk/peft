@@ -181,9 +181,14 @@ class HashHook(_Hook):
         prepare_layer_inputs_fn (Optional[callable]): Function to prepare layer inputs for hashing.
     """
 
-    def __init__(self, **base_class_kwargs):
+    def __init__(self, check_inputs: bool = True, check_outputs: bool = False, **base_class_kwargs):
         super().__init__(**base_class_kwargs)
+        if not check_inputs and not check_outputs:
+            raise ValueError("either check_inputs or check_outputs must be True")
+        self.check_inputs = check_inputs
+        self.check_outputs = check_outputs
         self.hashed_inputs = []
+        self.hashed_outputs = []
 
     @staticmethod
     def hash_fn(tensor):
@@ -191,9 +196,14 @@ class HashHook(_Hook):
 
     @torch.no_grad()
     def __call__(self, model, input, output):
-        x = self.prepare_layer_inputs(input)
-        x = self.gather_layer_inputs(x)
-        self.hashed_inputs.append(self.hash_fn(x.cpu()))
+        if self.check_inputs:
+            x = self.prepare_layer_inputs(input)
+            x = self.gather_layer_inputs(x)
+            self.hashed_inputs.append(self.hash_fn(x.cpu()))
+        if self.check_outputs:
+            x = self.prepare_layer_inputs(output)
+            x = self.gather_layer_inputs(x)
+            self.hashed_outputs.append(self.hash_fn(x.cpu()))
 
 
 def find_equal_values(dictionary: dict) -> dict:
@@ -302,6 +312,7 @@ class SingularVectorInitializer:
         rank_pattern: Optional[dict[str, int]] = None,
         compute_forward_svd: bool = False,
         compute_backward_svd: bool = False,
+        uniform_rank_per_layer: bool = True,
         sorting_metric: str = "evr",
         return_sva_metric_in_state_dict: bool = False,
         show_progress_bar: bool = True,
@@ -321,6 +332,7 @@ class SingularVectorInitializer:
         self.rank_pattern = rank_pattern if rank_pattern is not None else {}
         self.compute_forward_svd = compute_forward_svd
         self.compute_backward_svd = compute_backward_svd
+        self.uniform_rank_per_layer = uniform_rank_per_layer
         self.sorting_metric = SortingMetric(sorting_metric)
         self.return_sva_metric_in_state_dict = return_sva_metric_in_state_dict
         self.show_progress_bar = show_progress_bar
@@ -355,7 +367,8 @@ class SingularVectorInitializer:
         self.max_components = {}
         self.rank_budget = 0
 
-        self.layer_hook_map = {}
+        self.layer_hook_map_fw = {}
+        self.layer_hook_map_bw = {}
         self.equal_inputs_map = {}
 
         self.grad_hook_handle = None
@@ -369,6 +382,8 @@ class SingularVectorInitializer:
         inputs = next(iter(self.dataloader))
         inputs = self.move_inputs_to_device(inputs, self.model_device)
         model_inputs_for_hooks = self._get_model_inputs(inputs)
+        prepare_layer_inputs_fn_map = {}
+        check_equal_inputs = not (self.compute_backward_svd and self.uniform_rank_per_layer)
         for name, module in self.model.named_modules():
             if not self.target_module_check_fn(name, module):
                 continue
@@ -376,16 +391,23 @@ class SingularVectorInitializer:
                 fn = self.prepare_layer_inputs_fn.pop(name, None)
             else:
                 fn = self.prepare_layer_inputs_fn
-            hook = HashHook(
-                name=name, prepare_layer_inputs_fn=fn, gather_distributed_inputs=self.gather_distributed_inputs
-            )
-            hook.model_input = model_inputs_for_hooks
-            handle = module.register_forward_hook(hook)
-            self.hooks[name] = (hook, handle)
+            prepare_layer_inputs_fn_map[name] = fn
             self.target_layers.append(name)
             layer_rank = self.rank_pattern.get(get_pattern_key(self.rank_pattern.keys(), name), self.rank)
             self.max_components[name] = round(layer_rank * self.rho)
             self.rank_budget += layer_rank
+
+            if check_equal_inputs:
+                hook = HashHook(
+                    name=name,
+                    prepare_layer_inputs_fn=fn,
+                    gather_distributed_inputs=self.gather_distributed_inputs,
+                    check_inputs=self.compute_forward_svd,
+                    check_outputs=False,
+                )
+                hook.model_input = model_inputs_for_hooks
+                handle = module.register_forward_hook(hook)
+                self.hooks[name] = (hook, handle)
 
         if isinstance(self.prepare_layer_inputs_fn, Mapping) and len(self.prepare_layer_inputs_fn) < len(
             self.target_layers
@@ -395,52 +417,54 @@ class SingularVectorInitializer:
                 f"prepare_layer_inputs_fn is a mapping but the following module names were not found in the model: {missing}"
             )
 
-        # forward for one batch to check which layer inputs are equal to avoid unneeded svd calculations
-        self.forward_fn(self.model, inputs)
-        hash_dict = {k: h[0].hashed_inputs[0] for k, h in self.hooks.items()}
-        # equal input maps groups layers which receive the same input. One layer is defined as the key and receives an svd
-        # hook. For the remaining layers the svd results can be skipped.
-        equal_inputs = list(find_equal_values(hash_dict).values())
-        self.equal_inputs_map = {vv: v[0] for v in equal_inputs for vv in v[1:]}
-        # for layers with equal inputs we need to make sure that the max_components are the same
-        for names in equal_inputs:
-            max_value = max(self.max_components[n] for n in names)
-            for n in names:
-                self.max_components[n] = max_value
+        if check_equal_inputs:
+            # forward for one batch to check which layer inputs are equal to avoid unneeded svd calculations
+            self.forward_fn(self.model, inputs)
+            hash_dict = {k: h[0].hashed_inputs[0] for k, h in self.hooks.items()}
+            # equal input maps groups layers which receive the same input. One layer is defined as the key and receives an svd
+            # hook. For the remaining layers the svd results can be skipped.
+            equal_inputs = list(find_equal_values(hash_dict).values())
+            self.equal_inputs_map = {vv: v[0] for v in equal_inputs for vv in v[1:]}
+            # for layers with equal inputs we need to make sure that the max_components are the same
+            for names in equal_inputs:
+                max_value = max(self.max_components[n] for n in names)
+                for n in names:
+                    self.max_components[n] = max_value
 
         # initialize svd hooks
-        for name in list(self.hooks.keys()):
-            hook, handle = self.hooks.pop(name)
-            handle.remove()
-            if name in self.equal_inputs_map:
-                continue
+        for name in self.target_layers:
+            hook, handle = self.hooks.pop(name, (None, None))
+            if handle is not None:
+                handle.remove()
             module = self.model.get_submodule(name)
             hook_forward = None
             handle_forward = None
             hook_backward = None
             handle_backward = None
-            if self.compute_forward_svd:
+            if self.compute_forward_svd and name not in self.equal_inputs_map:
                 hook_forward = SVDHook(
                     n_components=self.max_components[name],
                     sim_thresh=self.tau,
                     name=name,
-                    prepare_layer_inputs_fn=hook._prepare_layer_inputs_fn,
+                    prepare_layer_inputs_fn=prepare_layer_inputs_fn_map[name],
                     gather_distributed_inputs=self.gather_distributed_inputs,
                     is_backward_hook=False,
                 )
                 handle_forward = module.register_forward_hook(hook_forward)
+                self.layer_hook_map_fw[name] = name
             if self.compute_backward_svd:
                 hook_backward = SVDHook(
                     n_components=self.max_components[name],
                     sim_thresh=self.tau,
                     name=name,
-                    prepare_layer_inputs_fn=hook._prepare_layer_inputs_fn,
+                    prepare_layer_inputs_fn=prepare_layer_inputs_fn_map[name],
                     gather_distributed_inputs=self.gather_distributed_inputs,
                     is_backward_hook=True,
                 )
                 handle_backward = module.register_full_backward_hook(hook_backward)
+                self.layer_hook_map_bw[name] = name
             self.hooks[name] = ((hook_forward, handle_forward), (hook_backward, handle_backward))
-        self.layer_hook_map = {**dict(zip(self.hooks.keys(), self.hooks.keys())), **self.equal_inputs_map}
+        self.layer_hook_map_fw.update(self.equal_inputs_map)
 
     def _get_sorting_metric(self, svd):
         if self.sorting_metric == SortingMetric.EXPLAINED_VARIANCE_RATIO:
@@ -460,10 +484,13 @@ class SingularVectorInitializer:
         Computes the rank distribution for each layer based on the explained variance ratio.
         When rank_pattern flag is False, all values in max_components are the same
         """
-        return {
-            k: self._get_sorting_metric(h[backward_svd][0].svd)[: self.max_components[k]]
-            for k, h in self.hooks.items()
-        }
+        metric_dict = {}
+        for k, layer_hooks in self.hooks.items():
+            hook = layer_hooks[backward_svd][0]
+            if hook is None:
+                continue
+            metric_dict[k] = self._get_sorting_metric(hook.svd)[: self.max_components[k]]
+        return metric_dict
 
     def _get_metric_dict_multi(self):
         metric_dict = {}
@@ -475,26 +502,38 @@ class SingularVectorInitializer:
             metric_dict[k] = metric_forward * metric_backward
         return metric_dict
 
-    def _get_rank_distribution(self):
-        def map_equal_inputs(ranks, equal_inputs_map):
-            for k, k_hook in equal_inputs_map.items():
-                # ensure hook layers have the highest rank if they are equal to another layer
-                rank, rank_hook = ranks[k], ranks[k_hook]
-                if rank_hook >= rank:
-                    continue
-                ranks[k_hook], ranks[k] = rank, rank_hook
-            return ranks
-
-        if self.compute_forward_svd and self.compute_backward_svd:
-            metric_dict = self._get_metric_dict_multi()
-        else:
-            metric_dict = self._get_metric_dict_single(self.compute_backward_svd)
-        keys, values = zip(*[(k, c) for k, name in self.layer_hook_map.items() for c in metric_dict[name]])
+    def _metric_dict_to_rank_dist(self, metric_dict, layer_hook_map, equal_map):
+        keys, values = zip(*[(k, c) for k, name in layer_hook_map.items() for c in metric_dict[name]])
         idx = torch.stack(values).argsort(descending=True)
         counts = Counter([keys[i] for i in idx[: self.rank_budget]])
-        ranks = {k: counts.get(k, 0) for k in self.layer_hook_map.keys()}  # add layers with 0 rank
-        ranks = map_equal_inputs(ranks, self.equal_inputs_map)
-        metric_dict = {k: metric_dict[name][: ranks[k]] for k, name in self.layer_hook_map.items()}
+        ranks = {k: counts.get(k, 0) for k in layer_hook_map.keys()}  # add layers with 0 rank
+        for k, k_hook in equal_map.items():
+            # ensure hook layers have the highest rank if they are equal to another layer
+            rank, rank_hook = ranks[k], ranks[k_hook]
+            if rank_hook >= rank:
+                continue
+            ranks[k_hook], ranks[k] = rank, rank_hook
+        metric_dict = {k: metric_dict[name][: ranks[k]] for k, name in layer_hook_map.items()}
+        return ranks, metric_dict
+
+    def _get_rank_distribution(self):
+        fwbw = self.compute_forward_svd and self.compute_backward_svd
+        if fwbw and not self.uniform_rank_per_layer:
+            md_fw = self._get_metric_dict_single(backward_svd=False)
+            md_bw = self._get_metric_dict_single(backward_svd=True)
+            r_fw, md_fw = self._metric_dict_to_rank_dist(md_fw, self.layer_hook_map_fw, self.equal_inputs_map)
+            r_bw, md_bw = self._metric_dict_to_rank_dist(md_bw, self.layer_hook_map_bw, {})
+            ranks = {k: (r_fw[k], r_bw[k]) for k in r_fw.keys()}
+            metric_dict = {k: md_bw[k] if r_bw > r_fw else md_fw[k] for k, (r_fw, r_bw) in ranks.items()}
+        else:
+            if fwbw:
+                metric_dict = self._get_metric_dict_multi()
+            else:
+                metric_dict = self._get_metric_dict_single(self.compute_backward_svd)
+            layer_hook_map = self.layer_hook_map_fw if self.compute_forward_svd else self.layer_hook_map_bw
+            equal_map = self.equal_inputs_map if self.compute_forward_svd else {}
+            ranks, metric_dict = self._metric_dict_to_rank_dist(metric_dict, layer_hook_map, equal_map)
+            ranks = {k: [ranks[k], ranks[k]] for k in ranks.keys()}
         return ranks, metric_dict
 
     @staticmethod
@@ -510,7 +549,7 @@ class SingularVectorInitializer:
         """
         Updates the convergence dictionary.
         """
-        converged = self._check_convergence(rank_dist[name], hook)
+        converged = self._check_convergence(rank_dist[name][backward], hook)
         # if a layer has switched from not converged to converged in the current step
         if (not convergence_dict[name][backward]) and converged and handle:
             handle.remove()
@@ -590,10 +629,8 @@ class SingularVectorInitializer:
             pbar = iter(cycle(self.dataloader))
             use_tqdm = False
         all_backward_converged = not self.compute_backward_svd
-        convergence_dict = {
-            k: [not self.compute_forward_svd, not self.compute_backward_svd] for k in self.hooks.keys()
-        }
-        rank_dist = self.max_components.copy()
+        convergence_dict = {k: [hf is None, hb is None] for k, ((hf, _), (hb, _)) in self.hooks.items()}
+        rank_dist = {k: [v, v] for k, v in self.max_components.items()}
         metric_dict = {}
         for inputs in pbar:
             if self.model_device is not None:
@@ -602,7 +639,7 @@ class SingularVectorInitializer:
             for name in list(self.hooks.keys()):
                 hook_forward, handle_forward = self.hooks[name][0]
                 hook_backward, handle_backward = self.hooks[name][1]
-                if self.compute_forward_svd:
+                if hook_forward is not None:
                     convergence_dict, handle_forward = self._update_convergence_dict(
                         name=name,
                         hook=hook_forward,
@@ -613,7 +650,7 @@ class SingularVectorInitializer:
                         all_backward_converged=all_backward_converged,
                     )
                     hook_forward.model_input = model_inputs_for_hooks
-                if self.compute_backward_svd:
+                if hook_backward is not None:
                     convergence_dict, handle_backward = self._update_convergence_dict(
                         name=name,
                         hook=hook_backward,
@@ -632,7 +669,7 @@ class SingularVectorInitializer:
 
             if use_tqdm:
                 layer_converged = [all(x) for x in convergence_dict.values()] + [
-                    all(convergence_dict[v]) for v in self.equal_inputs_map.values()
+                    convergence_dict[v][0] for v in self.equal_inputs_map.values()
                 ]
                 pbar.set_description(f"{sum(layer_converged)}/{len(layer_converged)} layers have converged")
 
@@ -676,26 +713,26 @@ class SingularVectorInitializer:
 
         sva_state_dict = {}
         converged = True
-        for name, rank in rank_dist.items():
+        for name, (rank_fw, rank_bw) in rank_dist.items():
             if self.compute_forward_svd:
-                hook_f, _ = self.hooks[self.layer_hook_map[name]][0]
-                u_A = hook_f.svd.components_[:rank]
+                hook_f, _ = self.hooks[self.layer_hook_map_fw[name]][0]
+                u_A = hook_f.svd.components_[:rank_fw]
                 if self.whiten:
-                    u_A = self._whiten(u_A, hook_f.svd.singular_values_[:rank])
-                converged = converged and self._check_convergence(rank, hook_f)
+                    u_A = self._whiten(u_A, hook_f.svd.singular_values_[:rank_fw])
+                converged = converged and self._check_convergence(rank_fw, hook_f)
                 sva_state_dict[f"{name}.sva_A"] = u_A
             if self.compute_backward_svd:
-                hook_b, _ = self.hooks[self.layer_hook_map[name]][1]
-                u_B = hook_b.svd.components_[:rank]
+                hook_b, _ = self.hooks[self.layer_hook_map_bw[name]][1]
+                u_B = hook_b.svd.components_[:rank_bw]
                 if self.whiten:
-                    u_B = self._whiten(u_B, hook_b.svd.singular_values_[:rank])
-                converged = converged and self._check_convergence(rank, hook_b)
+                    u_B = self._whiten(u_B, hook_b.svd.singular_values_[:rank_bw])
+                converged = converged and self._check_convergence(rank_bw, hook_b)
                 sva_state_dict[f"{name}.sva_B"] = u_B.T
             if self.return_sva_metric_in_state_dict:
                 sva_state_dict[f"{name}.sva_metric"] = metric_dict[name]
             if not converged:
                 raise ValueError(
-                    f"Layer {name} has not converged but was assigned rank {rank}. "
+                    f"Layer {name} has not converged but was assigned rank [{rank_fw}, {rank_bw}]. "
                     "Please report this issue at https://github.com/huggingface/peft/issues"
                 )
 

@@ -53,25 +53,27 @@ def _load_sva_state_dict(
         if not isinstance(module, SvaLayer):
             other_module_names.append(name_in_base_model)
             continue
-        # Regexp matching - Find key which matches current target_name in patterns provided
-        r = sva_config.rank_pattern.get(get_pattern_key(sva_config.rank_pattern.keys(), name), sva_config.r)
         sva_A = sva_state_dict.pop(f"{name}.sva_A", None)
         sva_B = sva_state_dict.pop(f"{name}.sva_B", None)
         sva_metric = sva_state_dict.pop(f"{name}.sva_metric", None)
         if sva_A is None or sva_B is None:
             raise ValueError(f"SVA state_dict is missing module {name}")
-        new_rank = sva_A.size(0)
-        if new_rank == 0:
+        new_rank_a = sva_A.size(0)
+        new_rank_b = sva_B.size(1)
+        if new_rank_a == 0 or new_rank_b == 0:
             parent, _, target_name = _get_submodules(model, name)
             setattr(parent, target_name, module.get_base_layer())
             continue
         module.update_layer(
-            sva_A=sva_A, sva_B=sva_B, sva_metric=sva_metric, r=new_rank, **update_layer_kwargs
+            sva_A=sva_A, sva_B=sva_B, sva_metric=sva_metric, r_a=new_rank_a, r_b=new_rank_b, **update_layer_kwargs
         )
         new_target_modules.append(name_in_base_model)
         # update rank pattern
-        if new_rank != sva_config.r:
-            rank_pattern[name_in_base_model] = new_rank
+        r = sva_config.rank_pattern.get(get_pattern_key(sva_config.rank_pattern.keys(), name), sva_config.r)
+        if isinstance(r, int):
+            r = (r, r)
+        if new_rank_a != r[0] or new_rank_b != r[1]:
+            rank_pattern[name_in_base_model] = (new_rank_a, new_rank_b)
 
     # update target modules if some lora layers have been removed due to their EVA rank being 0
     if len(new_target_modules) >= MIN_TARGET_MODULES_FOR_OPTIMIZATION:
@@ -180,6 +182,7 @@ def get_sva_state_dict(
             rank_pattern=None,
             compute_forward_svd=True,
             compute_backward_svd=True,
+            uniform_rank_per_layer=sva_config.uniform_rank_per_layer,
             sorting_metric=sva_config.sva_sorting_metric,
             return_sva_metric_in_state_dict=(sva_config.init_sva_weights == "sort_metric"),
             show_progress_bar=show_progress_bar,
